@@ -1,57 +1,78 @@
-// إدارة المفاتيح: GET القائمة (المفاتيح مُقنَّعة دائمًا) + POST إضافة مفتاح
-
-import { listKeys, insertKey, maskKey, DuplicateKeyError, type ApiKeyRow } from "@/lib/turso";
-import { dbErrorResponse } from "@/lib/api-utils";
+// ============================================================
+// /api/keys — إدارة المفاتيح للواجهة (قسم 4.4)
+// GET    : القائمة كاملة مع إخفاء المفاتيح دائمًا (maskKey) — لا يُعاد
+//          المفتاح الكامل في أي استجابة.
+// POST   : إضافة مفتاح مع رفض التكرار لنفس المزود.
+// ============================================================
+import { ensureSchema, findKeyByProviderAndValue, insertKey, listKeys } from "@/lib/turso";
+import { maskKey, timeAgoAr } from "@/lib/core";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// شكل آمن للمفتاح — لا يُعاد api_key الكامل في أي استجابة أبدًا
-function masked(k: ApiKeyRow) {
-  return {
-    id: k.id,
-    provider: k.provider,
-    label: k.label,
-    masked: maskKey(k.api_key),
-    status: k.status,
-    usage_count: k.usage_count,
-    success_count: k.success_count,
-    fail_count: k.fail_count,
-    last_used_at: k.last_used_at,
-    last_error: k.last_error,
-    created_at: k.created_at,
-  };
-}
+const PROVIDERS = ["kie", "cometapi"] as const;
 
-export async function GET(): Promise<Response> {
+export async function GET() {
   try {
+    await ensureSchema();
     const keys = await listKeys();
-    return Response.json({ keys: keys.map(masked) });
-  } catch (err) {
-    return dbErrorResponse(err);
+    return Response.json({
+      keys: keys.map((k) => ({
+        id: k.id,
+        provider: k.provider,
+        label: k.label,
+        masked: maskKey(k.api_key),
+        status: k.status,
+        usageCount: k.usage_count,
+        successCount: k.success_count,
+        failCount: k.fail_count,
+        lastError: k.last_error,
+        lastUsedAt: k.last_used_at,
+        lastCheckedAt: k.last_checked_at,
+        createdAt: k.created_at,
+        createdAtLabel: timeAgoAr(k.created_at),
+      })),
+    });
+  } catch (e) {
+    return Response.json({ error: `تعذر جلب المفاتيح: ${e instanceof Error ? e.message : String(e)}` }, { status: 500 });
   }
 }
 
-export async function POST(request: Request): Promise<Response> {
+export async function POST(req: Request) {
   try {
-    const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
-    const provider = String(body?.provider ?? "").trim();
-    const apiKey = String(body?.api_key ?? "").trim();
-    const label = String(body?.label ?? "").trim();
+    await ensureSchema();
+    const body = (await req.json().catch(() => null)) as
+      | { provider?: string; api_key?: string; label?: string }
+      | null;
+    const provider = body?.provider?.trim() ?? "";
+    const apiKey = body?.api_key?.trim() ?? "";
+    const label = body?.label?.trim() ?? "";
 
-    if (provider !== "kie" && provider !== "cometapi") {
-      return Response.json({ ok: false, error: "المزود غير صالح — القيمتان المسموحتان: kie أو cometapi" }, { status: 400 });
+    if (!PROVIDERS.includes(provider as (typeof PROVIDERS)[number])) {
+      return Response.json({ error: "المزود غير صالح — المتاح: kie أو cometapi" }, { status: 400 });
     }
-    if (!apiKey) {
-      return Response.json({ ok: false, error: "مفتاح API مطلوب" }, { status: 400 });
+    if (apiKey.length < 8) {
+      return Response.json({ error: "المفتاح قصير جدًا — تحقق من القيمة المُدخلة" }, { status: 400 });
     }
-
-    const created = await insertKey(provider, apiKey, label);
-    return Response.json({ ok: true, key: masked(created) }, { status: 201 });
-  } catch (err) {
-    if (err instanceof DuplicateKeyError) {
-      return Response.json({ ok: false, error: "هذا المفتاح مسجَّل مسبقًا لنفس المزود." }, { status: 409 });
+    const dup = await findKeyByProviderAndValue(provider, apiKey);
+    if (dup) {
+      return Response.json({ error: "هذا المفتاح مضاف مسبقًا لنفس المزود — رفض التكرار" }, { status: 409 });
     }
-    return dbErrorResponse(err);
+    const key = await insertKey(provider, apiKey, label);
+    return Response.json(
+      {
+        key: {
+          id: key.id,
+          provider: key.provider,
+          label: key.label,
+          masked: maskKey(key.api_key),
+          status: key.status,
+          createdAt: key.created_at,
+        },
+      },
+      { status: 201 },
+    );
+  } catch (e) {
+    return Response.json({ error: `تعذر إضافة المفتاح: ${e instanceof Error ? e.message : String(e)}` }, { status: 500 });
   }
 }

@@ -1,0 +1,9 @@
+# لا ترفع أبدًا التبعيات أو المخرجات أو الأسرار
+node_modules/
+.next/
+out/
+build/
+.env*
+!.env.example
+*.log
+.DS_Store

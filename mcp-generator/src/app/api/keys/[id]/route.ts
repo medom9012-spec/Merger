@@ -1,61 +1,38 @@
-// تعطيل/تنشيط مفتاح (PATCH) وحذفه (DELETE) — المفاتيح مُقنَّعة دائمًا
-
-import { updateKey, deleteKey, maskKey, NoDatabaseError, type ApiKeyRow } from "@/lib/turso";
-import { dbErrorResponse } from "@/lib/api-utils";
+// ============================================================
+// /api/keys/{id} — تعطيل/تنشيط يدوي (PATCH) وحذف (DELETE)
+// ============================================================
+import { deleteKey, ensureSchema, getKeyById, updateKey } from "@/lib/turso";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function masked(k: ApiKeyRow) {
-  return {
-    id: k.id,
-    provider: k.provider,
-    label: k.label,
-    masked: maskKey(k.api_key),
-    status: k.status,
-    usage_count: k.usage_count,
-    success_count: k.success_count,
-    fail_count: k.fail_count,
-    last_used_at: k.last_used_at,
-    last_error: k.last_error,
-    created_at: k.created_at,
-  };
-}
-
-export async function PATCH(
-  request: Request,
-  ctx: { params: Promise<{ id: string }> }
-): Promise<Response> {
+export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const { id } = await ctx.params;
-    const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
-    const status = String(body?.status ?? "").trim();
+    await ensureSchema();
+    const { id } = await params;
+    const body = (await req.json().catch(() => null)) as { status?: string } | null;
+    const status = body?.status;
     if (status !== "active" && status !== "disabled") {
-      return Response.json({ ok: false, error: "الحالة غير صالحة — القيمتان المسموحتان: active أو disabled" }, { status: 400 });
+      return Response.json({ error: "الحالة المطلوبة غير صالحة — المتاح: active أو disabled" }, { status: 400 });
     }
-    const updated = await updateKey(id, { status });
-    if (!updated) {
-      return Response.json({ ok: false, error: "المفتاح غير موجود" }, { status: 404 });
-    }
-    return Response.json({ ok: true, key: masked(updated) });
-  } catch (err) {
-    return dbErrorResponse(err);
+    const key = await getKeyById(id);
+    if (!key) return Response.json({ error: "المفتاح غير موجود" }, { status: 404 });
+    // التنشيط اليدوي يعيد المفتاح المستنزف/المعطل إلى الخدمة
+    await updateKey(id, { status, last_error: status === "active" ? null : key.last_error });
+    return Response.json({ ok: true, id, status });
+  } catch (e) {
+    return Response.json({ error: `تعذر تحديث المفتاح: ${e instanceof Error ? e.message : String(e)}` }, { status: 500 });
   }
 }
 
-export async function DELETE(
-  _request: Request,
-  ctx: { params: Promise<{ id: string }> }
-): Promise<Response> {
+export async function DELETE(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const { id } = await ctx.params;
-    const deleted = await deleteKey(id);
-    if (!deleted) {
-      return Response.json({ ok: false, error: "المفتاح غير موجود" }, { status: 404 });
-    }
-    return Response.json({ deleted: true });
-  } catch (err) {
-    if (err instanceof NoDatabaseError) return dbErrorResponse(err);
-    return dbErrorResponse(err);
+    await ensureSchema();
+    const { id } = await params;
+    const ok = await deleteKey(id);
+    if (!ok) return Response.json({ error: "المفتاح غير موجود" }, { status: 404 });
+    return Response.json({ ok: true, id });
+  } catch (e) {
+    return Response.json({ error: `تعذر حذف المفتاح: ${e instanceof Error ? e.message : String(e)}` }, { status: 500 });
   }
 }

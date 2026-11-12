@@ -1,59 +1,60 @@
-// سجل الموديلات المدمجة: الاسم الموحد (canonical) والبدائل وأسماء الموديل لكل مزود
-
+// ============================================================
+// سجل الموديلات — الاسم canonical كما يراه عميل MCP، مع قبول الصيغ البديلة
+// (نقاط/شرطات) وتوحّدها. أسماء المزودات قابلة للتجاوز بمتغيرات البيئة.
+// ============================================================
 export type ProviderId = "kie" | "cometapi";
+export type TaskProvider = ProviderId | "merger";
 export type MediaType = "image" | "video" | "merge";
 
 export interface ModelDef {
-  canonical: string;   // الاسم كما يراه عميل MCP
-  aliases: string[];   // صيغ بديلة نقبلها ونوحدّها
+  canonical: string; // الاسم كما يراه عميل MCP
+  aliases: string[]; // صيغ بديلة نقبلها ونوحدّها
   type: MediaType;
-  providers: ProviderId[]; // تُجرَّب مفاتيح كل هؤلاء بالترتيب
+  providers: ProviderId[]; // من يستطيع خدمته — تُجرَّب مفاتيحهم كلها بالترتيب
   providerModel: Record<ProviderId, string>; // اسم الموديل كما يُرسل لكل مزود
 }
 
-// تجاوز الأسماء عبر متغيرات البيئة إن وُجدت
-function envOverride(key: string, fallback: string): string {
-  const v = (process.env[key] || "").trim();
-  return v || fallback;
-}
+const KIE_IMAGE_MODEL = process.env.KIE_IMAGE_MODEL?.trim() || "gpt-image-2-6/flare-text-to-image";
+const KIE_VIDEO_MODEL = process.env.KIE_VIDEO_MODEL?.trim() || "grok-imagine-video-1-5-preview";
+const COMETAPI_IMAGE_MODEL = process.env.COMETAPI_IMAGE_MODEL?.trim() || "gpt-image-2.6-flare-text-to-image";
+const COMETAPI_VIDEO_MODEL = process.env.COMETAPI_VIDEO_MODEL?.trim() || "grok-imagine-video-1-5-preview";
 
 export const MODELS: ModelDef[] = [
   {
     canonical: "gpt-image-2-6/flare-text-to-image",
-    aliases: ["gpt-image-2.6/flare-text-to-image"],
+    aliases: [
+      "gpt-image-2.6/flare-text-to-image",
+      "gpt-image-2.6-flare-text-to-image",
+      "gpt-image-2-6-flare-text-to-image",
+    ],
     type: "image",
     providers: ["kie", "cometapi"],
-    providerModel: {
-      kie: envOverride("KIE_IMAGE_MODEL", "gpt-image-2-6/flare-text-to-image"),
-      cometapi: envOverride("COMETAPI_IMAGE_MODEL", "gpt-image-2.6-flare-text-to-image"),
-    },
+    providerModel: { kie: KIE_IMAGE_MODEL, cometapi: COMETAPI_IMAGE_MODEL },
   },
   {
     canonical: "grok-imagine-video-1-5-preview",
     aliases: ["grok-imagine-video-1.5-preview"],
     type: "video",
     providers: ["kie", "cometapi"],
-    providerModel: {
-      kie: envOverride("KIE_VIDEO_MODEL", "grok-imagine-video-1-5-preview"),
-      cometapi: envOverride("COMETAPI_VIDEO_MODEL", "grok-imagine-video-1-5-preview"),
-    },
+    providerModel: { kie: KIE_VIDEO_MODEL, cometapi: COMETAPI_VIDEO_MODEL },
   },
 ];
 
-export const DEFAULT_IMAGE_MODEL = MODELS[0].canonical;
-export const DEFAULT_VIDEO_MODEL = MODELS[1].canonical;
-
-// توحيد اسم الموديل عبر canonical + aliases (غير حساس لحالة الأحرف)
-export function normalizeModel(name?: string | null): ModelDef | null {
-  if (!name) return null;
-  const n = name.trim().toLowerCase();
-  return (
-    MODELS.find(
-      (m) => m.canonical.toLowerCase() === n || m.aliases.some((a) => a.toLowerCase() === n)
-    ) ?? null
-  );
+export function defaultModelFor(type: "image" | "video"): string {
+  return type === "image" ? MODELS[0].canonical : MODELS[1].canonical;
 }
 
-export function modelByType(type: MediaType): ModelDef | null {
-  return MODELS.find((m) => m.type === type) ?? null;
+/** توحيد اسم الموديل: نقبل الشرطات والنقاط بالتبادل ثم نطابق canonical/aliases */
+export function resolveModel(input: string): ModelDef | null {
+  const raw = (input || "").trim();
+  if (!raw) return null;
+  const low = raw.toLowerCase();
+  const norm = low.replaceAll(".", "-").replaceAll("_", "-");
+  for (const m of MODELS) {
+    if (m.canonical.toLowerCase() === low) return m;
+    if (m.aliases.some((a) => a.toLowerCase() === low)) return m;
+    if (m.canonical.toLowerCase().replaceAll(".", "-") === norm) return m;
+    if (m.aliases.some((a) => a.toLowerCase().replaceAll(".", "-") === norm)) return m;
+  }
+  return null;
 }

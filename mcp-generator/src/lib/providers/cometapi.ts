@@ -1,177 +1,158 @@
-// مزود CometAPI (ثانوي — أفضل جهد، لا مفتاح متاح للاختبار الفعلي):
-// - الصور: نقطة متوافقة مع OpenAI (POST /v1/images/generations) تُعيد النتيجة فورًا (createImageSync).
-// - الفيديو: مهام غير متزامنة بنمط create/check على /v1/tasks (دفاعي كليًا: أي شكل غير متوقع → مؤقت).
-import { ProviderError } from "../errors";
-import type { CheckResult, ProviderAdapter } from "./types";
+// ============================================================
+// مزود CometAPI — api.cometapi.com
+// • الصور: نقطة متوافقة مع OpenAI تُعيد النتيجة فورًا (تزامنية):
+//     POST /v1/images/generations  {model, prompt, n, size?, background?, output_format?, response_format?}
+//     → {"created":…, "data":[{"url" | "b64_json"}]}
+// • الفيديو: نقطة مهام غير متزامنة (التوثيق الرسمي apidoc.cometapi.com):
+//     POST /v1/videos  (multipart: prompt, model, seconds?, size?, input_reference?)
+//     → {"id"/"task_id", "status":"queued", "progress":0}
+//     GET  /v1/videos/{id} → status: queued|in_progress|completed|failed|error
+// ملاحظة: هذا المزود ثانوي — لا يُفعَّل مساره إلا بإضافة مفتاح CometAPI من الواجهة.
+// ============================================================
+import { ProviderError, type ProviderAdapter, type ProviderKey } from "./types";
 
-const COMET_BASE = "https://api.cometapi.com";
-const TIMEOUT_MS = 30_000;
+const BASE = "https://api.cometapi.com/v1";
 
-// نداء موحد — يرمي ProviderError عند !ok، ويعيد الحالة والجسم عند النجاح
-async function cometFetch(
+async function cometJson(
+  key: ProviderKey,
   path: string,
-  key: string,
   init?: RequestInit,
-  timeoutMs = TIMEOUT_MS
-): Promise<{ status: number; body: Record<string, unknown> }> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+): Promise<Record<string, unknown>> {
+  let res: Response;
   try {
-    const res = await fetch(COMET_BASE + path, {
+    res = await fetch(`${BASE}${path}`, {
       ...init,
       headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        ...(init?.headers as Record<string, string> | undefined),
+        Authorization: `Bearer ${key.api_key}`,
+        ...(init?.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
+        ...(init?.headers ?? {}),
       },
-      signal: ctrl.signal,
-      cache: "no-store",
+      signal: AbortSignal.timeout(60_000),
     });
-    const text = await res.text();
-    let body: Record<string, unknown> = {};
-    try { body = JSON.parse(text) as Record<string, unknown>; } catch { body = { raw: text }; }
-    if (!res.ok) {
-      const msg = (typeof body.error === "string" && body.error) ||
-        (typeof body.message === "string" && body.message) ||
-        (typeof body.msg === "string" && body.msg) ||
-        `CometAPI HTTP ${res.status}`;
-      throw new ProviderError(String(msg), res.status);
-    }
-    return { status: res.status, body };
-  } catch (err) {
-    if (err instanceof ProviderError) throw err;
-    const msg = err instanceof Error ? (err.name === "AbortError" ? "انتهت مهلة الاتصال بـ CometAPI" : err.message) : String(err);
-    throw new ProviderError(msg); // مؤقت
-  } finally {
-    clearTimeout(timer);
+  } catch (e) {
+    throw new ProviderError(`CometAPI network error: ${(e as Error).message}`);
+  }
+  const text = await res.text();
+  let body: Record<string, unknown> | null = null;
+  try { body = JSON.parse(text); } catch { body = null; }
+  if (!res.ok) {
+    const msg = ((body as { error?: { message?: string } | string; message?: string })?.error);
+    const msgText =
+      typeof msg === "string" ? msg : msg?.message ?? (body?.message as string) ?? `HTTP ${res.status}`;
+    throw new ProviderError(String(msgText), res.status);
+  }
+  return body ?? {};
+}
+
+/** تحويل aspect_ratio + resolution إلى حجم WxH قريب مدعوم لدى CometAPI */
+function sizeForVideo(aspect?: string, resolution?: string): string | undefined {
+  const h = resolution === "1080p" ? 1080 : resolution === "720p" ? 720 : 480;
+  const w16 = Math.round((h * 16) / 9 / 2) * 2;
+  switch (aspect) {
+    case "16:9": return `${w16}x${h}`;
+    case "9:16": return `${h}x${w16}`;
+    case "1:1": return `${h}x${h}`;
+    case "3:2": return `${Math.round((h * 3) / 2 / 2) * 2}x${h}`;
+    case "2:3": return `${h}x${Math.round((h * 3) / 2 / 2) * 2}`;
+    default: return undefined; // auto → نترك الاختيار للمزود
   }
 }
 
-// استخراج دفاعي لأول معرّف مهمة من أشكال استجابة مختلفة محتملة
-function pickTaskId(body: unknown): string | null {
-  const b = (body ?? {}) as Record<string, unknown>;
-  const data = b.data as Record<string, unknown> | undefined;
-  for (const v of [data?.id, data?.taskId, data?.task_id, b.id, b.taskId, b.task_id]) {
-    if (typeof v === "string" && v) return v;
-    if (typeof v === "number") return String(v);
+/** تحويل aspect_ratio إلى حجم صورة مدعوم (gpt-image: مربع/أفقي/عمودي) */
+function sizeForImage(aspect?: string): string | undefined {
+  switch (aspect) {
+    case "16:9": case "3:2": case "5:4": case "2:1": case "21:9": case "3:1":
+      return "1536x1024";
+    case "9:16": case "2:3": case "4:5": case "1:2": case "9:21": case "1:3":
+      return "1024x1536";
+    case "1:1": case "4:3": case "3:4":
+      return "1024x1024";
+    default:
+      return undefined; // auto
   }
-  return null;
 }
 
-// استخراج دفاعي للروابط: نجمع كل الروابط ونفضّل ما ينتهي بامتداد وسائط
-function extractUrls(value: unknown, depth = 0): string[] {
-  const all: string[] = [];
-  const visit = (v: unknown, d: number) => {
-    if (d > 6 || v == null) return;
-    if (typeof v === "string") {
-      if (/^https?:\/\/\S+$/i.test(v)) all.push(v);
-      return;
+/** استخراج روابط من استجابة استعلام مهمة فيديو — دفاعي بلا اختراع حقول */
+function extractVideoUrls(body: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  const candidates: unknown[] = [
+    body, body.data, body.result, body.output,
+    (body as { video?: unknown }).video,
+  ];
+  for (const c of candidates) {
+    if (!c || typeof c !== "object") continue;
+    const o = c as Record<string, unknown>;
+    for (const f of ["url", "video_url", "videoUrl", "download_url", "downloadUrl"]) {
+      const v = o[f];
+      if (typeof v === "string" && /^https?:\/\//.test(v)) out.push(v);
     }
-    if (Array.isArray(v)) { v.forEach((x) => visit(x, d + 1)); return; }
-    if (typeof v === "object") { Object.values(v as Record<string, unknown>).forEach((x) => visit(x, d + 1)); }
-  };
-  visit(value, depth);
-  const media = all.filter((u) => /\.(mp4|webm|mov|m4v|png|jpe?g|webp|gif)(\?|#|$)/i.test(u));
-  return media.length ? [...new Set(media)] : [...new Set(all)];
+    if (Array.isArray(o.data)) {
+      for (const d of o.data as Record<string, unknown>[]) {
+        if (d && typeof d.url === "string" && /^https?:\/\//.test(d.url)) out.push(d.url);
+      }
+    }
+  }
+  return [...new Set(out)];
 }
 
-function mapStatus(raw: unknown): "processing" | "completed" | "failed" {
-  const st = String(raw ?? "").toLowerCase();
-  if (["completed", "success", "succeeded", "done", "finished"].includes(st)) return "completed";
-  if (["failed", "error", "failure", "cancelled", "canceled"].includes(st)) return "failed";
-  return "processing";
-}
-
-export const cometapiAdapter: ProviderAdapter = {
-  id: "cometapi",
-
-  // صور متزامنة — نمط OpenAI: {model, prompt, size?...} → data[0].url أو b64_json
-  async createImageSync(key, input) {
+export const cometApiAdapter: ProviderAdapter = {
+  // الصور عبر CometAPI تُعاد فورًا — نستخدم createImageSync
+  async createImageSync(key: ProviderKey, model: string, input: Record<string, unknown>) {
     const payload: Record<string, unknown> = {
-      model: input.model,
+      model,
       prompt: input.prompt,
       n: 1,
+      response_format: "url",
     };
-    // تحويل تقريبي لنسبة الأبعاد إلى حجم (أفضل جهد)
-    const sizeMap: Record<string, string> = {
-      "1:1": "1024x1024",
-      "16:9": "1792x1024",
-      "9:16": "1024x1792",
-      "3:2": "1536x1024",
-      "2:3": "1024x1536",
-    };
-    const size = sizeMap[String(input.aspect_ratio ?? "")];
-    if (size) payload.size = size;
+    if (typeof input.aspect_ratio === "string" && input.aspect_ratio !== "auto") {
+      payload.size = sizeForImage(input.aspect_ratio);
+    }
+    if (typeof input.background === "string" && input.background !== "auto") payload.background = input.background;
+    if (typeof input.output_format === "string") payload.output_format = input.output_format;
 
-    const { body } = await cometFetch("/v1/images/generations", key, {
+    const body = await cometJson(key, "/images/generations", {
       method: "POST",
       body: JSON.stringify(payload),
     });
-    const data = body.data;
-    if (!Array.isArray(data) || data.length === 0) {
-      throw new ProviderError(`CometAPI: شكل استجابة غير متوقع لتوليد الصور: ${JSON.stringify(body).slice(0, 200)}`);
-    }
-    const urls: string[] = [];
-    for (const item of data as Record<string, unknown>[]) {
-      if (typeof item?.url === "string" && item.url) urls.push(item.url);
-      else if (typeof item?.b64_json === "string" && item.b64_json) {
-        urls.push(`data:image/png;base64,${item.b64_json}`);
-      }
-    }
-    if (urls.length === 0) throw new ProviderError("CometAPI: لم يُعثر على رابط صورة في الاستجابة");
+    const data = (body.data ?? []) as { url?: string; b64_json?: string }[];
+    const urls = (data ?? [])
+      .map((d) => (d?.url ? d.url : d?.b64_json ? `data:image/png;base64,${d.b64_json}` : ""))
+      .filter((u) => u.length > 0);
+    if (!urls.length) throw new ProviderError("CometAPI images: استجابة بلا روابط", 502);
     return { urls };
   },
 
-  // فيديو — مهام غير متزامنة (نمط create/check دفاعي)
-  async createTask(key, model, input) {
-    const { status, body } = await cometFetch("/v1/tasks", key, {
-      method: "POST",
-      body: JSON.stringify({ model, ...input }),
-    });
-    const id = pickTaskId(body);
-    if (!id) {
-      throw new ProviderError(`CometAPI: شكل استجابة غير متوقع لإنشاء المهمة (HTTP ${status}): ${JSON.stringify(body).slice(0, 200)}`);
-    }
-    return { providerTaskId: id };
+  // الفيديو غير متزامن: إنشاء مهمة ثم استعلام حالتها
+  async createTask(key: ProviderKey, model: string, input: Record<string, unknown>) {
+    const form = new FormData();
+    form.append("model", model);
+    form.append("prompt", String(input.prompt ?? ""));
+    const seconds = Number(input.duration);
+    if (Number.isFinite(seconds) && seconds > 0) form.append("seconds", String(Math.min(30, Math.round(seconds))));
+    const size = sizeForVideo(input.aspect_ratio as string | undefined, input.resolution as string | undefined);
+    if (size) form.append("size", size);
+    if (typeof input.image_url === "string" && input.image_url) form.append("input_reference", input.image_url);
+
+    const body = await cometJson(key, "/videos", { method: "POST", body: form });
+    const taskId = (body.task_id ?? body.id) as string | undefined;
+    if (!taskId) throw new ProviderError("CometAPI videos: استجابة بلا task_id", 502);
+    return { providerTaskId: taskId };
   },
 
-  async checkTask(key, providerTaskId): Promise<CheckResult> {
-    let status = 200;
-    let body: Record<string, unknown> = {};
-    try {
-      const r = await cometFetch(`/v1/tasks/${encodeURIComponent(providerTaskId)}`, key);
-      status = r.status;
-      body = r.body;
-    } catch (err) {
-      // 404 → المهمة غير موجودة لدى المزود (فشل حقيقي وليس مؤقتًا)
-      if (err instanceof ProviderError && err.status === 404) {
-        return { status: "failed", error: "المهمة غير موجودة لدى المزود" };
-      }
-      throw err;
+  async checkTask(key: ProviderKey, providerTaskId: string) {
+    const body = await cometJson(key, `/videos/${encodeURIComponent(providerTaskId)}`, { method: "GET" });
+    const status = String(body.status ?? "").toLowerCase();
+    if (status === "completed" || status === "succeeded" || status === "success") {
+      const urls = extractVideoUrls(body);
+      if (!urls.length) return { status: "failed" as const, error: "اكتمل التوليد دون روابط نتيجة" };
+      return { status: "completed" as const, urls, progress: 100 };
     }
-
-    const raw = ((body.data as Record<string, unknown> | undefined) ?? body) as Record<string, unknown>;
-    const st = mapStatus(raw.status ?? raw.state);
-
-    if (st === "completed") {
-      const urls = extractUrls(raw);
-      if (urls.length === 0) return { status: "failed", error: "اكتملت المهمة لكن لم يُعثر على رابط ناتج" };
-      return { status: "completed", urls };
+    if (status === "failed" || status === "error" || status === "cancelled") {
+      const msg = (body.error as { message?: string } | string | undefined);
+      const errText = typeof msg === "string" ? msg : msg?.message ?? "فشل التوليد لدى المزود";
+      return { status: "failed" as const, error: String(errText) };
     }
-    if (st === "failed") {
-      const errMsg = typeof raw.error === "string" && raw.error
-        ? raw.error
-        : typeof raw.message === "string" && raw.message
-          ? raw.message
-          : "أعلن المزود فشل المهمة";
-      return { status: "failed", error: errMsg };
-    }
-
-    // progress قد يأتي كسرًا 0..1 أو نسبة 0..100
-    const p = Number(raw.progress);
-    const progress = Number.isFinite(p) ? (p > 0 && p <= 1 ? Math.round(p * 100) : Math.round(p)) : undefined;
-    void status;
-    return { status: "processing", progress };
+    const progress = typeof body.progress === "number" ? Math.min(90, Math.max(5, body.progress)) : undefined;
+    return { status: "processing" as const, progress };
   },
 };

@@ -1,93 +1,102 @@
-// مزود kie.ai — Jobs API الموحد (أشكال حقيقية مقاسة):
+// ============================================================
+// مزود kie.ai — Jobs API الموحد (التوثيق الرسمي: docs.kie.ai)
 // POST /api/v1/jobs/createTask  → {"code":200,"data":{"taskId":"..."}}
-// GET  /api/v1/jobs/recordInfo?taskId=<id> → {"code":200,"data":{"state":"...","resultJson":"...","failMsg":...}}
-import { ProviderError } from "../errors";
-import type { CheckResult, ProviderAdapter } from "./types";
+// GET  /api/v1/jobs/recordInfo?taskId=… → {"code":200,"data":{
+//         "state":"waiting|queuing|generating|success|fail",
+//         "resultJson":"{\"resultUrls\":[\"…\"]}",   // نص JSON داخل JSON
+//         "failMsg":"..."}}
+// الأشكال أعلاه مقاسة بنداءات حقيقية — إن تغيّر الشكل لاحقًا نتبع التوثيق
+// الرسمي ولا نخترع حقولًا.
+// ============================================================
+import { ProviderError, type ProviderAdapter, type ProviderKey } from "./types";
 
-const KIE_BASE = "https://api.kie.ai";
-const TIMEOUT_MS = 30_000;
+const BASE = "https://api.kie.ai/api/v1/jobs";
 
-// نداء موحد مع مهلة (AbortController) — انتهاء المهلة/الشبكة = مؤقت
-async function kieFetch(path: string, key: string, init?: RequestInit): Promise<Record<string, unknown>> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+async function kieFetch(
+  key: ProviderKey,
+  path: string,
+  init?: RequestInit,
+): Promise<Record<string, unknown>> {
+  let res: Response;
   try {
-    const res = await fetch(KIE_BASE + path, {
+    res = await fetch(`${BASE}${path}`, {
       ...init,
       headers: {
-        Authorization: `Bearer ${key}`,
+        Authorization: `Bearer ${key.api_key}`,
         "Content-Type": "application/json",
-        Accept: "application/json",
-        ...(init?.headers as Record<string, string> | undefined),
+        ...(init?.headers ?? {}),
       },
-      signal: ctrl.signal,
-      cache: "no-store",
+      signal: AbortSignal.timeout(30_000),
     });
-    const text = await res.text();
-    let body: Record<string, unknown> | null = null;
-    try { body = JSON.parse(text) as Record<string, unknown>; } catch { /* جسم غير JSON */ }
-
-    if (!res.ok) {
-      const b = (body ?? {}) as Record<string, unknown>;
-      const msg = (typeof b.msg === "string" && b.msg) || (typeof b.message === "string" && b.message) || `kie.ai HTTP ${res.status}`;
-      throw new ProviderError(String(msg), res.status);
-    }
-    // kie يعيد {"code":200,...} — أي كود آخر يُعامل كخطأ بنفس الكود ليُصنَّف
-    const code = body && typeof body.code === "number" ? body.code : 200;
-    if (code !== 200) {
-      const b = (body ?? {}) as Record<string, unknown>;
-      const msg = (typeof b.msg === "string" && b.msg) || `kie.ai code ${code}`;
-      throw new ProviderError(String(msg), code >= 400 && code < 600 ? code : res.status);
-    }
-    return body ?? {};
-  } catch (err) {
-    if (err instanceof ProviderError) throw err;
-    const msg = err instanceof Error ? (err.name === "AbortError" ? "انتهت مهلة الاتصال بـ kie.ai" : err.message) : String(err);
-    throw new ProviderError(msg); // بلا حالة HTTP → مؤقت
-  } finally {
-    clearTimeout(timer);
+  } catch (e) {
+    // انقطاع شبكة/timeout → بلا status → يُصنَّف temporary
+    throw new ProviderError(`kie.ai network error: ${(e as Error).message}`);
   }
+  const text = await res.text();
+  let body: Record<string, unknown> | null = null;
+  try { body = JSON.parse(text); } catch { body = null; }
+
+  if (!res.ok) {
+    const msg = (body?.msg ?? body?.message ?? `HTTP ${res.status}`) as string;
+    throw new ProviderError(String(msg), res.status);
+  }
+  // بعض استجابات kie.ai تحمل code داخل الجسم مع HTTP 200
+  const code = typeof body?.code === "number" ? body.code : 200;
+  if (code !== 200) {
+    const msg = (body?.msg ?? body?.message ?? `kie.ai code ${code}`) as string;
+    throw new ProviderError(String(msg), code >= 400 && code < 600 ? code : undefined);
+  }
+  return body ?? {};
 }
 
 export const kieAdapter: ProviderAdapter = {
-  id: "kie",
-
-  async createTask(key, model, input) {
-    const body = await kieFetch("/api/v1/jobs/createTask", key, {
+  async createTask(key: ProviderKey, model: string, input: Record<string, unknown>) {
+    const body = await kieFetch(key, "/createTask", {
       method: "POST",
       body: JSON.stringify({ model, input }),
     });
-    const data = body.data as Record<string, unknown> | undefined;
+    const data = body.data as { taskId?: string } | undefined;
     const taskId = data?.taskId;
-    if (typeof taskId !== "string" || !taskId) {
-      throw new ProviderError("kie.ai: استجابة createTask بلا taskId"); // مؤقت — شكل غير متوقع
-    }
+    if (!taskId) throw new ProviderError("kie.ai createTask: استجابة بلا taskId", 502);
     return { providerTaskId: taskId };
   },
 
-  async checkTask(key, providerTaskId): Promise<CheckResult> {
-    const body = await kieFetch(`/api/v1/jobs/recordInfo?taskId=${encodeURIComponent(providerTaskId)}`, key);
-    const data = body.data as Record<string, unknown> | undefined;
-    if (!data) throw new ProviderError("kie.ai: استجابة recordInfo بلا data");
+  async checkTask(key: ProviderKey, providerTaskId: string) {
+    const body = await kieFetch(
+      key,
+      `/recordInfo?taskId=${encodeURIComponent(providerTaskId)}`,
+      { method: "GET" },
+    );
+    const data = (body.data ?? {}) as {
+      state?: string;
+      resultJson?: string;
+      failMsg?: string;
+    };
+    const state = String(data.state ?? "waiting").toLowerCase();
 
-    const state = String(data.state ?? "").toLowerCase();
     if (state === "success") {
-      // resultJson نص JSON داخل نص — يحتاج JSON.parse ثانيًا
+      // resultJson نص يحتاج JSON.parse ثانيًا (انتبه: قد يتغير الشكل — نتبع التوثيق)
       let urls: string[] = [];
-      try {
-        const parsed = typeof data.resultJson === "string" ? JSON.parse(data.resultJson) : data.resultJson;
-        const ru = (parsed as Record<string, unknown>)?.resultUrls;
-        if (Array.isArray(ru)) {
-          urls = ru.filter((u): u is string => typeof u === "string" && /^https?:\/\//i.test(u));
-        }
-      } catch { /* تُعالج كقائمة فارغة أدناه */ }
-      return { status: "completed", urls };
+      if (data.resultJson) {
+        try {
+          const parsed = JSON.parse(data.resultJson) as Record<string, unknown>;
+          const raw = (parsed.resultUrls ?? parsed.resultUrl ?? parsed.urls) as unknown;
+          if (Array.isArray(raw)) {
+            urls = raw.filter((u): u is string => typeof u === "string" && /^https?:\/\//.test(u));
+          } else if (typeof raw === "string" && /^https?:\/\//.test(raw)) {
+            urls = [raw];
+          }
+        } catch { /* نعاملها كلا روابط */ }
+      }
+      if (!urls.length) return { status: "failed" as const, error: "اكتمل التوليد دون روابط نتيجة صالحة" };
+      return { status: "completed" as const, urls, progress: 100 };
     }
-    if (state === "fail") {
-      return { status: "failed", error: (typeof data.failMsg === "string" && data.failMsg) || "أعلن المزود فشل المهمة" };
+
+    if (state === "fail" || state === "failed" || state === "error") {
+      return { status: "failed" as const, error: data.failMsg || "فشل التوليد لدى المزود" };
     }
-    // waiting → 5 ، queuing → 15 ، generating → 55
-    const progress = state === "generating" ? 55 : state === "queuing" ? 15 : 5;
-    return { status: "processing", progress };
+
+    const progress = state === "generating" ? 45 : state === "queuing" ? 15 : 5;
+    return { status: "processing" as const, progress };
   },
 };

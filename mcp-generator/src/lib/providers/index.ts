@@ -1,18 +1,19 @@
-// خريطة المزودات — أي مزود مجهول يرمي خطأ
-import type { ProviderId } from "../models";
-import { kieAdapter } from "./kie";
-import { cometapiAdapter } from "./cometapi";
+// ============================================================
+// فهرس المزودات — يربط معرّف المزود بمحوّله
+// ============================================================
 import type { ProviderAdapter } from "./types";
+import { kieAdapter } from "./kie";
+import { cometApiAdapter } from "./cometapi";
 
-const ADAPTERS: Record<ProviderId, ProviderAdapter> = {
+const ADAPTERS: Record<string, ProviderAdapter> = {
   kie: kieAdapter,
-  cometapi: cometapiAdapter,
+  cometapi: cometApiAdapter,
 };
 
 export function getAdapter(provider: string): ProviderAdapter {
-  const adapter = ADAPTERS[provider as ProviderId];
-  if (!adapter) throw new Error(`مزود غير معروف: ${provider}`);
-  return adapter;
+  const a = ADAPTERS[provider];
+  if (!a) throw new Error(`لا يوجد محوّل للمزود: ${provider}`);
+  return a;
 }
 
-export type { ProviderAdapter, CheckResult } from "./types";
+export { kieAdapter, cometApiAdapter };

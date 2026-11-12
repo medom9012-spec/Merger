@@ -1,0 +1,17 @@
+# التبعيات والبناء
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# الأسرار — لا ترفع أي ملف بيئة إطلاقًا (نُبقي على النموذج فقط)
+.env
+.env.*
+!.env.example
+
+# النشر
+.vercel
+
+# سجلات
+*.log
